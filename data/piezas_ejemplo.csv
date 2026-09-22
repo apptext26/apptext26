@@ -1,0 +1,4 @@
+Modelo,Talla,Pieza,Cantidad,Ancho,Largo,RotacionPermitida
+MODELO-001,L,FT,1,23,21,False
+MODELO-001,L,BK,1,23,21,False
+MODELO-001,L,SL,2,18,11,False
