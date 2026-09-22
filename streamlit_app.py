@@ -1,90 +1,51 @@
 import pandas as pd
 import streamlit as st
-from core import generate_candidates, validate_inputs
-from visualization import candidate_figure
-from exports import candidates_to_excel
-
-st.set_page_config(page_title="Predictor AccuMark / AccuNest", page_icon="📐", layout="wide")
+from core import parse_cut,normalize_library,generate,validate
+from visualization import cut_figure,candidate_figure
+from exports import library_excel
+st.set_page_config(page_title="Predictor AccuMark / AccuNest",page_icon="📐",layout="wide")
 st.title("Predictor de combinaciones AccuMark / AccuNest")
-st.caption("Comparador rectangular predictivo. No sustituye el anidado geométrico de AccuNest.")
-
-@st.cache_data
-def examples():
-    pieces=pd.read_csv("data/piezas_ejemplo.csv")
-    req=pd.read_csv("data/requerimientos_ejemplo.csv")
-    return pieces,req
-
-def read_upload(upload):
-    if upload.name.lower().endswith(".csv"):
-        return pd.read_csv(upload,sep=None,engine="python")
-    return pd.read_excel(upload,engine="openpyxl")
-
-p0,r0=examples()
-with st.sidebar:
-    st.header("Configuración")
-    width=st.number_input("Ancho de tela",min_value=0.01,value=72.0,step=0.5)
-    c1,c2=st.columns(2)
-    lmin=c1.number_input("Capas mín.",min_value=1,value=50)
-    lmax=c2.number_input("Capas máx.",min_value=1,value=50)
-    step=st.number_input("Incremento",min_value=1,value=1)
-    max_over=st.number_input("Sobreproducción máxima (%)",min_value=0.0,value=25.0)
-    allow_short=st.checkbox("Permitir faltante temporal",value=True)
-    random_n=st.slider("Iteraciones aleatorias",0,100,20)
-    max_candidates=st.slider("Máximo de candidatos",10,500,100,10)
-    st.subheader("Pesos del ranking")
-    wg=st.slider("Geométrico",0.0,1.0,0.40,0.05)
-    wc=st.slider("Cumplimiento",0.0,1.0,0.30,0.05)
-    wo=st.slider("Baja sobreproducción",0.0,1.0,0.15,0.05)
-    wop=st.slider("Operabilidad",0.0,1.0,0.15,0.05)
-
-st.subheader("1. Datos de entrada")
-a,b=st.columns(2)
-with a:
-    up_p=st.file_uploader("Biblioteca de piezas (CSV/XLSX)",type=["csv","xlsx"],key="p")
-    try: pieces=read_upload(up_p) if up_p else p0.copy()
-    except Exception as e: st.error(f"No se pudo leer la biblioteca: {e}"); pieces=p0.copy()
-    pieces=st.data_editor(pieces,num_rows="dynamic",use_container_width=True,key="pieces")
-with b:
-    up_r=st.file_uploader("Requerimientos (CSV/XLSX)",type=["csv","xlsx"],key="r")
-    try: req=read_upload(up_r) if up_r else r0.copy()
-    except Exception as e: st.error(f"No se pudo leer el requerimiento: {e}"); req=r0.copy()
-    req=st.data_editor(req,num_rows="dynamic",use_container_width=True,key="req")
-
-if st.button("Generar candidatos",type="primary",use_container_width=True):
-    errors,warnings=validate_inputs(pieces,req)
-    for w in warnings: st.warning(w)
-    if errors:
-        for e in errors: st.error(e)
-    else:
-        weights={"geometry":wg,"compliance":wc,"low_over":wo,"operability":wop}
-        total=sum(weights.values())
-        if total<=0: st.error("La suma de pesos debe ser mayor que cero.")
-        else:
-            weights={k:v/total for k,v in weights.items()}
-            try:
-                st.session_state.candidates=generate_candidates(pieces,req,width,lmin,lmax,step,max_over,allow_short,random_n,max_candidates,weights)
-                st.session_state.params={"AnchoTela":width,"CapasMin":lmin,"CapasMax":lmax,"Incremento":step,"SobreproduccionMaxPct":max_over,"IteracionesAleatorias":random_n,**weights}
-            except Exception as e: st.error(f"No fue posible generar candidatos: {e}")
-
-cs=st.session_state.get("candidates",[])
-if cs:
-    st.subheader("2. Ranking de candidatos")
-    rows=[]
-    for c in cs:
-        rows.append({"Candidato":c.candidate_id,"Capas":c.layers,"Estrategia":c.strategy,"Repeticiones":", ".join(f"{k}={v}" for k,v in c.repetitions.items()),"Bloques":len(c.blocks),"Piezas":sum(len(x.pieces) for x in c.blocks),"Largo":c.estimated_length,"Eficiencia %":100*c.rectangular_efficiency,"Cumplimiento %":100*c.demand_compliance,"Puntaje":c.total_score})
-    ranking=pd.DataFrame(rows)
-    st.dataframe(ranking,hide_index=True,use_container_width=True,column_config={"Eficiencia %":st.column_config.NumberColumn(format="%.2f%%"),"Cumplimiento %":st.column_config.NumberColumn(format="%.2f%%"),"Puntaje":st.column_config.NumberColumn(format="%.2f")})
-    selected=st.selectbox("Candidato para inspeccionar",[c.candidate_id for c in cs])
-    c=next(x for x in cs if x.candidate_id==selected)
-    m1,m2,m3,m4=st.columns(4)
-    m1.metric("Largo estimado",f"{c.estimated_length:.2f}")
-    m2.metric("Eficiencia rectangular",f"{c.rectangular_efficiency:.2%}")
-    m3.metric("Bloques",len(c.blocks))
-    m4.metric("Puntuación",f"{c.total_score:.2f}")
-    st.plotly_chart(candidate_figure(c),use_container_width=True)
-    block_rows=[{"Bloque":b.number,"Ancho usado":b.used_width,"Libre":b.free_width,"Largo":b.length,"Piezas":", ".join(p.uid for p in b.pieces)} for b in c.blocks]
-    st.dataframe(pd.DataFrame(block_rows),hide_index=True,use_container_width=True)
-    excel=candidates_to_excel(cs,st.session_state.params)
-    st.download_button("Descargar resultados en Excel",excel,"resultados_predictor_accunest.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
-else:
-    st.info("Revise los datos y pulse “Generar candidatos”. Los ejemplos precargados reproducen el caso obligatorio de talla L.")
+st.caption("Analiza CUT/TXT, construye una biblioteca rectangular y compara candidatos. No sustituye AccuNest.")
+if 'library' not in st.session_state:st.session_state.library=pd.read_csv('data/piezas_ejemplo.csv')
+if 'req' not in st.session_state:st.session_state.req=pd.read_csv('data/requerimientos_ejemplo.csv')
+tab1,tab2,tab3=st.tabs(["1. Analizador CUT/TXT","2. Predictor","3. Metodología"])
+with tab1:
+ files=st.file_uploader("Cargue uno o varios CUT/TXT",type=['cut','txt'],accept_multiple_files=True)
+ if files:
+  parsed=[parse_cut(f.getvalue(),f.name) for f in files];st.session_state.parsed=parsed
+ if st.session_state.get('parsed'):
+  parsed=st.session_state.parsed
+  diag=pd.DataFrame([p['diagnostic'] for p in parsed]);st.subheader('Diagnóstico');st.dataframe(diag,hide_index=True,use_container_width=True)
+  combined=pd.concat([p['library'] for p in parsed],ignore_index=True)
+  # Merge exact model/size/piece across files conservatively.
+  combined=combined.groupby(['Modelo','Talla','Pieza'],as_index=False).agg(InstanciasCUT=('InstanciasCUT','max'),RepeticionesTalla=('RepeticionesTalla','max'),Cantidad=('Cantidad','max'),Ancho=('Ancho','max'),Largo=('Largo','max'),Unidad=('Unidad','first'),Confianza=('Confianza','min'))
+  st.info('InstanciasCUT es lo encontrado en el marcador. Ajuste RepeticionesTalla si el CUT contiene más de una repetición de una talla.')
+  edited=st.data_editor(combined,num_rows='dynamic',use_container_width=True,key='cutlib')
+  normalized=normalize_library(edited);st.subheader('Biblioteca normalizada');st.dataframe(normalized,hide_index=True,use_container_width=True)
+  c1,c2=st.columns(2)
+  if c1.button('Usar biblioteca detectada',type='primary',use_container_width=True):st.session_state.library=normalized.drop(columns=['Unidad','Confianza']);st.success('Biblioteca enviada al predictor.')
+  c2.download_button('Descargar biblioteca y diagnóstico',library_excel(normalized,diag),'biblioteca_cut.xlsx',use_container_width=True)
+  pick=st.selectbox('Archivo para visualizar',[p['diagnostic']['Archivo'] for p in parsed]);pp=next(p for p in parsed if p['diagnostic']['Archivo']==pick);st.plotly_chart(cut_figure(pp),use_container_width=True)
+with tab2:
+ with st.sidebar:
+  st.header('Configuración');width=st.number_input('Ancho de tela',0.01,value=80.0);a,b=st.columns(2);lmin=a.number_input('Capas mín.',1,value=50);lmax=b.number_input('Capas máx.',1,value=50);step=st.number_input('Incremento',1,value=1);maxover=st.number_input('Sobreproducción máxima (%)',0.0,value=25.0);short=st.checkbox('Permitir faltante temporal',True);rn=st.slider('Iteraciones aleatorias',0,100,20);maxn=st.slider('Máximo de candidatos',10,500,100,10)
+  st.subheader('Pesos');wg=st.slider('Geométrico',0.,1.,.4,.05);wc=st.slider('Cumplimiento',0.,1.,.3,.05);wo=st.slider('Baja sobreproducción',0.,1.,.15,.05);wp=st.slider('Operabilidad',0.,1.,.15,.05)
+ st.subheader('Datos de entrada');x,y=st.columns(2)
+ with x:lib=st.data_editor(st.session_state.library,num_rows='dynamic',use_container_width=True,key='libedit')
+ with y:req=st.data_editor(st.session_state.req,num_rows='dynamic',use_container_width=True,key='reqedit')
+ if st.button('Generar candidatos',type='primary',use_container_width=True):
+  es=validate(lib,req)
+  if es:[st.error(e) for e in es]
+  else:
+   s=wg+wc+wo+wp;w={'g':wg/s,'c':wc/s,'o':wo/s,'p':wp/s};st.session_state.cs,st.session_state.stats=generate(lib,req,width,lmin,lmax,step,maxover,short,rn,maxn,w)
+ cs=st.session_state.get('cs',[])
+ if cs:
+  q=st.session_state.stats;c1,c2,c3=st.columns(3);c1.metric('Evaluados',q['evaluados']);c2.metric('Distribuciones únicas',q['unicos']);c3.metric('Duplicados agrupados',q['duplicados'])
+  rows=[]
+  for c in cs:rows.append({'Candidato':c.candidate_id,'Capas':c.layers,'Estrategia principal':c.strategy,'Estrategias equivalentes':len(c.equivalent_strategies),'Bloques':len(c.blocks),'Piezas':sum(len(b.pieces) for b in c.blocks),'Largo':c.estimated_length,'Eficiencia %':100*c.rectangular_efficiency,'Cumplimiento %':100*c.demand_compliance,'Puntaje':c.total_score})
+  st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
+  sid=st.selectbox('Inspeccionar',[c.candidate_id for c in cs]);c=next(z for z in cs if z.candidate_id==sid)
+  if c.equivalent_strategies:st.caption('Estrategias equivalentes agrupadas: '+', '.join(c.equivalent_strategies))
+  st.plotly_chart(candidate_figure(c),use_container_width=True)
+with tab3:
+ st.markdown("""### Reglas aplicadas\n- Las coordenadas se leen directamente del CUT/TXT.\n- La escala se contrasta con el ancho declarado del marcador.\n- Las dimensiones son rectángulos envolventes según la orientación del marcador.\n- En piezas izquierda/derecha se conserva la dimensión máxima para evitar subestimar.\n- **Instancias CUT** y **cantidad por prenda** se mantienen separadas.\n- Los candidatos equivalentes se agrupan por contenido exacto de bloques, capas y repeticiones.""")

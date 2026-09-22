@@ -1,1 +1,1 @@
-from .domain import PieceInstance, Block, Candidate
+from .domain import PieceInstance,Block,Candidate

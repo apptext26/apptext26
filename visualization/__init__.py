@@ -1,1 +1,1 @@
-from .block_plotter import candidate_figure
+from .plots import cut_figure,candidate_figure

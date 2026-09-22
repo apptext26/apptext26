@@ -1,4 +1,4 @@
-Modelo,Talla,Pieza,Cantidad,Ancho,Largo,RotacionPermitida
-MODELO-001,L,FT,1,23,21,False
-MODELO-001,L,BK,1,23,21,False
-MODELO-001,L,SL,2,18,11,False
+Modelo,Talla,Pieza,Cantidad,Ancho,Largo
+3238OW,L,BK,1,31.37,23.87
+3238OW,L,FT,1,29.94,23.87
+3238OW,L,SL,2,11.90,17.71
