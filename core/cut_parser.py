@@ -168,8 +168,10 @@ def parse_cut(raw: bytes, name: str = "archivo") -> dict[str, Any]:
             geometry[geometry_id] = {
                 "points": points,
                 "xmin": min(xs), "xmax": max(xs), "ymin": min(ys), "ymax": max(ys),
-                "width": (max(xs) - min(xs)) / scale,
-                "length": (max(ys) - min(ys)) / scale,
+                # X = dirección longitudinal del marcador.
+                # Y = dirección transversal, correspondiente al ancho de tela.
+                "width": (max(ys) - min(ys)) / scale,
+                "length": (max(xs) - min(xs)) / scale,
                 "scale": scale,
                 "source": name,
             }
