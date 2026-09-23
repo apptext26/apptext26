@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple
 import math
 
 from .optimizer import expand, distributions
-
+from .rectangle_packer import RectItem, pack_rectangles
 
 @dataclass
 class ProposedMarker:
