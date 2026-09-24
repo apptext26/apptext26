@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Tuple
 import math
 
@@ -462,8 +462,14 @@ def generate_marker_plan(
                 "Revise restricciones, capas y dimensiones."
             )
 
-        current_marker.marker_id = f"MK-{len(markers) + 1:03d}"
-        markers.append(current_marker)
+        # `evaluate()` cachea por ratio. No reutilizar el mismo objeto mutable
+        # para dos tendidos: provocaba IDs duplicados en el reporte y al seleccionar.
+        final_marker = replace(
+            current_marker,
+            marker_id=f"MK-{len(markers) + 1:03d}",
+            repetitions=dict(current_marker.repetitions),
+        )
+        markers.append(final_marker)
 
     audit = []
     delivered = {key: 0 for key in required}

@@ -1,13 +1,20 @@
+"""Evaluación de capas uniformes. La comparación prioriza consumo físico.
+
+El total de longitudes de marcadores por sí solo no equivale al consumo:
+consumo (unidades lineales de entrada) = Σ largo_marcador × capas_marcador.
+No se aplican conversiones de unidad ni desperdicios de extremos de tendido.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Any
+from typing import Any, Callable
+from time import perf_counter
 
 
 @dataclass
 class LayerPlanAlternative:
     plan_id: str
-    layers: int
+    layers: int | None
     plan: Any
     marker_count: int
     total_length: float
@@ -15,17 +22,59 @@ class LayerPlanAlternative:
     shortage: int
     overproduction: int
     score: float
+    consumption: float = 0.0
+    mixed: bool = False
+    origin: str = "uniforme"
 
 
-def _production_deviation(plan) -> tuple[int, int]:
-    shortage = 0
-    overproduction = 0
-    for row in plan.audit:
-        required = int(row.get("Unidades requeridas", 0))
-        produced = int(row.get("Unidades producidas", 0))
-        shortage += max(0, required - produced)
-        overproduction += max(0, produced - required)
-    return shortage, overproduction
+def production_deviation(plan) -> tuple[int, int]:
+    shortage = sum(int(row.get("Faltante", 0)) for row in plan.audit)
+    excess = sum(int(row.get("Sobreproducción", 0)) for row in plan.audit)
+    return shortage, excess
+
+
+def fabric_consumption(plan) -> float:
+    return sum(float(m.estimated_length) * int(m.layers) for m in plan.markers)
+
+
+def weighted_rectangular_efficiency(plan, fabric_width: float | None = None) -> float:
+    """Pondera por tela realmente extendida, no por promedio de marcadores."""
+    total_bbox_area = 0.0
+    total_fabric_area = 0.0
+    for marker in plan.markers:
+        width = float(fabric_width or marker.packing.fabric_width)
+        area = width * float(marker.estimated_length) * int(marker.layers)
+        total_fabric_area += area
+        total_bbox_area += area * float(marker.rectangular_efficiency)
+    return total_bbox_area / total_fabric_area if total_fabric_area else 0.0
+
+
+def sample_layers(layers_min: int, layers_max: int, layer_step: int, limit: int | None) -> list[int]:
+    """Muestra acotada pero incluye extremos y valores próximos al máximo."""
+    values = list(range(int(layers_min), int(layers_max) + 1, int(layer_step)))
+    if not values or not limit or len(values) <= limit:
+        return values
+    limit = max(2, int(limit))
+    indices = {0, len(values) - 1}
+    if limit >= 4:
+        indices.update({len(values) - 2, len(values) - 3})
+    for i in range(limit):
+        indices.add(round(i * (len(values) - 1) / (limit - 1)))
+    # Dar preferencia a extremos, valor alto y diversidad cuando sobran índices.
+    if len(indices) > limit:
+        essentials = {0, len(values) - 1}
+        if limit >= 4:
+            essentials.update({len(values) - 2, len(values) - 3})
+        extras = sorted(indices - essentials, key=lambda i: (-min(i, len(values) - 1 - i), -i))
+        indices = essentials | set(extras[:limit - len(essentials)])
+    return [values[i] for i in sorted(indices)]
+
+
+def _sort_key(item: LayerPlanAlternative) -> tuple:
+    return (
+        bool(item.shortage), item.shortage, round(item.consumption, 7),
+        item.overproduction, item.marker_count, -item.average_efficiency,
+    )
 
 
 def evaluate_layer_range(
@@ -34,61 +83,54 @@ def evaluate_layer_range(
     layers_max: int,
     layer_step: int,
     top_k: int = 5,
-    length_weight: float = 0.35,
-    efficiency_weight: float = 0.30,
-    marker_weight: float = 0.15,
-    overproduction_weight: float = 0.20,
+    max_layer_trials: int | None = None,
+    diagnostics: list[dict] | None = None,
     **plan_kwargs,
 ) -> list[LayerPlanAlternative]:
-    """Evalúa cada cantidad de capas y devuelve una lista corta no redundante."""
+    """Genera planes uniformes y los compara por consumo estimado de tela."""
     if layers_min <= 0 or layers_max < layers_min or layer_step <= 0:
         raise ValueError("Rango de capas inválido.")
-
-    raw = []
-    for layers in range(int(layers_min), int(layers_max) + 1, int(layer_step)):
+    if top_k <= 0:
+        raise ValueError("top_k debe ser positivo.")
+    attempts = sample_layers(layers_min, layers_max, layer_step, max_layer_trials)
+    alternatives: list[LayerPlanAlternative] = []
+    for layers in attempts:
+        started = perf_counter()
         try:
             plan = plan_factory(layers=layers, **plan_kwargs)
-        except (ValueError, RuntimeError):
+        except (ValueError, RuntimeError) as error:
+            if diagnostics is not None:
+                diagnostics.append({"Fase": "uniforme", "Capas": layers,
+                                    "Estado": "inviable", "Razón": str(error)[:240],
+                                    "Segundos": round(perf_counter() - started, 4),
+                                    "Cache packings": len(plan_kwargs.get("packing_cache") or {})})
             continue
-        shortage, overproduction = _production_deviation(plan)
-        raw.append((layers, plan, shortage, overproduction))
-
-    if not raw:
-        raise ValueError("Ninguna cantidad de capas produjo un plan viable.")
-
-    max_length = max(float(plan.total_length) for _, plan, _, _ in raw) or 1.0
-    max_markers = max(len(plan.markers) for _, plan, _, _ in raw) or 1
-    max_over = max(over for _, _, _, over in raw) or 1
-
-    alternatives = []
-    for layers, plan, shortage, overproduction in raw:
-        length_score = 1.0 - float(plan.total_length) / max_length
-        efficiency_score = float(plan.average_efficiency)
-        marker_score = 1.0 - len(plan.markers) / max_markers
-        over_score = 1.0 - overproduction / max_over
-        score = 100 * (
-            length_weight * length_score
-            + efficiency_weight * efficiency_score
-            + marker_weight * marker_score
-            + overproduction_weight * over_score
+        shortage, overproduction = production_deviation(plan)
+        consumption = fabric_consumption(plan)
+        if diagnostics is not None:
+            diagnostics.append({"Fase": "uniforme", "Capas": layers,
+                                "Estado": "viable" if not shortage else "faltante",
+                                "Marcadores": len(plan.markers),
+                                "Consumo estimado": round(consumption, 5),
+                                "Faltante": shortage, "Sobreproducción": overproduction,
+                                "Segundos": round(perf_counter() - started, 4),
+                                "Cache packings": len(plan_kwargs.get("packing_cache") or {})})
+        alternative = LayerPlanAlternative(
+            plan_id="", layers=layers, plan=plan,
+            marker_count=len(plan.markers), total_length=float(plan.total_length),
+            average_efficiency=weighted_rectangular_efficiency(plan),
+            shortage=shortage, overproduction=overproduction,
+            score=0.0, consumption=consumption,
         )
-        # Los planes con faltante no se consideran recomendados.
-        if shortage:
-            score -= 1000 + shortage
-        alternatives.append(LayerPlanAlternative(
-            plan_id="",
-            layers=layers,
-            plan=plan,
-            marker_count=len(plan.markers),
-            total_length=float(plan.total_length),
-            average_efficiency=float(plan.average_efficiency),
-            shortage=shortage,
-            overproduction=overproduction,
-            score=score,
-        ))
-
-    alternatives.sort(key=lambda item: (-item.score, item.shortage, item.total_length, item.overproduction))
-    selected = alternatives[: max(1, int(top_k))]
-    for index, alternative in enumerate(selected, 1):
-        alternative.plan_id = f"PLAN-{index:03d}"
+        alternatives.append(alternative)
+    if not alternatives:
+        raise ValueError("Ninguna cantidad de capas produjo un plan viable.")
+    alternatives.sort(key=_sort_key)
+    best_consumption = min(a.consumption for a in alternatives if a.shortage == 0) if any(a.shortage == 0 for a in alternatives) else None
+    for alt in alternatives:
+        # Solo para compatibilidad con UI antigua, NO se usa en la elección.
+        alt.score = round(100.0 * (best_consumption / alt.consumption), 2) if best_consumption and alt.consumption and not alt.shortage else 0.0
+    selected = alternatives[: int(top_k)]
+    for i, alt in enumerate(selected, 1):
+        alt.plan_id = f"UNI-{i:03d}"
     return selected
