@@ -180,18 +180,32 @@ def pack_rectangles(
     max_length: float,
     random_iterations: int = 12,
     seed: int = 42,
+    max_evaluations: int | None = None,
 ) -> PackingResult:
-    """MaxRects multiheurístico para strip packing rectangular sin rotación."""
+    """MaxRects sin rotación con presupuesto de búsqueda opcional.
+
+    max_evaluations limita el trabajo cuando ya existe una solución factible.
+    Si las primeras pruebas fallan, se prueban las restantes para NO declarar
+    incorrectamente que un marker es imposible debido al presupuesto rápido.
+    """
     items = list(items)
     if not items:
         raise ValueError("No hay piezas para acomodar.")
     if fabric_width <= 0 or max_length <= 0:
         raise ValueError("Ancho y largo máximo deben ser mayores que cero.")
+    if random_iterations < 0 or (max_evaluations is not None and max_evaluations <= 0):
+        raise ValueError("Los parámetros de búsqueda no son válidos.")
     too_wide = [item.uid for item in items if item.width > fabric_width + 1e-9]
     if too_wide:
         raise ValueError(f"Piezas más anchas que la tela: {too_wide[:5]}")
+    if any(item.length > max_length + 1e-9 for item in items):
+        raise ValueError("Existe una pieza más larga que el marcador permitido.")
+    total_area = sum(item.area for item in items)
+    area_lower_bound = total_area / fabric_width
+    if area_lower_bound > max_length + 1e-9:
+        raise ValueError("El área rectangular supera la capacidad máxima del marcador.")
 
-    orders = [
+    base_orders = [
         ("area_desc", sorted(items, key=lambda p: (p.area, p.length, p.width), reverse=True)),
         ("length_desc", sorted(items, key=lambda p: (p.length, p.width), reverse=True)),
         ("width_desc", sorted(items, key=lambda p: (p.width, p.length), reverse=True)),
@@ -201,20 +215,40 @@ def pack_rectangles(
     for index in range(random_iterations):
         shuffled = list(items)
         rng.shuffle(shuffled)
-        orders.append((f"random_{index + 1}", shuffled))
+        base_orders.append((f"random_{index + 1}", shuffled))
 
-    heuristics = ["best_short_side", "best_long_side", "best_area", "bottom_left", "length_aware"]
-    candidates: list[PackingResult] = []
-    for order_name, order in orders:
-        for heuristic in heuristics:
+    # Piezas con dimensiones idénticas son intercambiables geométricamente.
+    # No reejecutar una heurística sobre el mismo orden dimensional.
+    seen_orders: set[tuple] = set()
+    orders = []
+    for name, order in base_orders:
+        signature = tuple((p.width, p.length) for p in order)
+        if signature not in seen_orders:
+            seen_orders.add(signature)
+            orders.append((name, order))
+
+    # Round-robin: un presupuesto de 4–8 pruebas incluye varios órdenes,
+    # no solamente cinco heurísticas aplicadas al mismo orden de piezas.
+    heuristics = ["length_aware", "best_area", "bottom_left", "best_short_side", "best_long_side"]
+    best: PackingResult | None = None
+    tried = 0
+    for heuristic in heuristics:
+        for order_name, order in orders:
+            if best is not None and max_evaluations is not None and tried >= max_evaluations:
+                return best
             result = _pack_order(order, fabric_width, max_length, heuristic)
+            tried += 1
             if result is not None:
                 result.heuristic = f"maxrects_{heuristic}_{order_name}"
-                candidates.append(result)
+                if best is None or result.used_length < best.used_length - 1e-9:
+                    best = result
+                # La cota de área es un límite inferior real de packing rectangular.
+                if best.used_length <= area_lower_bound + 1e-9:
+                    return best
 
-    if not candidates:
+    if best is None:
         raise ValueError("No se encontró una acomodación rectangular dentro de los límites.")
-    return min(candidates, key=lambda result: (result.used_length, -result.efficiency))
+    return best
 
 
 def validate_no_overlap(result: PackingResult, eps: float = 1e-8) -> bool:
