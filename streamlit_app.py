@@ -1,3 +1,5 @@
+import hashlib
+
 import pandas as pd
 import streamlit as st
 
@@ -41,6 +43,7 @@ def clear_calculation_results():
     st.session_state.pop("layer_alternatives", None)
     st.session_state.pop("selected_plan_id", None)
     st.session_state.pop("selected_marker_id", None)
+    st.session_state.pop("last_run_settings", None)
 
 
 def format_repetitions(repetitions):
@@ -124,295 +127,294 @@ with tab_cut:
         "Cargue uno o varios archivos CUT/TXT",
         type=["cut", "txt"],
         accept_multiple_files=True,
+        key="cut_uploads",
     )
 
     if uploads:
+        # El tamaño solo no identifica un archivo; dos CUT distintos pueden medir igual.
         upload_signature = tuple(
-            (upload.name, len(upload.getvalue())) for upload in uploads
+            (upload.name, hashlib.sha256(upload.getvalue()).hexdigest())
+            for upload in uploads
         )
         if st.session_state.get("upload_signature") != upload_signature:
-            st.session_state.parsed_cut = [
-                parse_cut(upload.getvalue(), upload.name)
-                for upload in uploads
+            parsed_files_new = [
+                parse_cut(upload.getvalue(), upload.name) for upload in uploads
             ]
+            detected_new, conflicts_new = consolidate_cut_libraries(parsed_files_new)
+            st.session_state.parsed_cut = parsed_files_new
+            st.session_state.cut_detected = detected_new.copy()
+            st.session_state.cut_conflicts = conflicts_new
+            st.session_state.cut_working_library = detected_new.copy()
+            st.session_state.cut_editor_revision = (
+                st.session_state.get("cut_editor_revision", 0) + 1
+            )
             st.session_state.upload_signature = upload_signature
             clear_calculation_results()
+    elif st.session_state.get("upload_signature") is not None:
+        # El usuario quitó todos los archivos: no conservar bibliotecas CUT obsoletas.
+        for name in (
+            "parsed_cut", "upload_signature", "cut_detected",
+            "cut_conflicts", "cut_working_library",
+        ):
+            st.session_state.pop(name, None)
+        clear_calculation_results()
 
     parsed_files = st.session_state.get("parsed_cut", [])
-
     if parsed_files:
-        diagnostics = pd.DataFrame(
-            [parsed["diagnostic"] for parsed in parsed_files]
-        )
+        diagnostics = pd.DataFrame([p["diagnostic"] for p in parsed_files])
         st.subheader("Diagnóstico")
         st.dataframe(diagnostics, hide_index=True, use_container_width=True)
-
-        detected, consolidation_conflicts = consolidate_cut_libraries(
-            parsed_files
-        )
+        conflicts = st.session_state.cut_conflicts
 
         st.info(
-            "Ancho corresponde al eje transversal de la tela y Largo a la "
-            "dirección longitudinal del marcador. Ajuste RepeticionesTalla "
-            "cuando el CUT contenga más de una repetición."
+            "Ancho = transversal; Largo = longitudinal. Las correcciones se "
+            "conservan en la sesión hasta cargar otros CUT. Pulse Guardar para "
+            "validar sus cambios; los campos no se recalculan mientras escribe."
         )
-
-        detected_edited = st.data_editor(
-            detected,
-            num_rows="dynamic",
-            use_container_width=True,
-            key="detected_library_editor",
-            disabled=[
-                "Modelo",
-                "Talla",
-                "Pieza",
-                "InstanciasCUT",
-                "Origenes",
-                "IDRepresentante",
-                "DimensionStatus",
-            ],
-            column_config={
-                "ConflictoCritico": st.column_config.CheckboxColumn(
-                    "Conflicto crítico",
-                    help=(
-                        "Desmarque solamente después de revisar y corregir "
-                        "manualmente dimensiones y conteos."
-                    ),
-                ),
-                "RepeticionesTalla": st.column_config.NumberColumn(
-                    "Repeticiones talla",
-                    min_value=1,
-                    step=1,
-                    format="%d",
-                ),
-                "Ancho": st.column_config.NumberColumn(
-                    "Ancho transversal",
-                    min_value=0.0001,
-                    format="%.4f",
-                ),
-                "Largo": st.column_config.NumberColumn(
-                    "Largo longitudinal",
-                    min_value=0.0001,
-                    format="%.4f",
-                ),
-            },
-        )
-
-        if not consolidation_conflicts.empty:
-            st.error(
-                "Existen conflictos críticos entre los CUT cargados. "
-                "Revise archivo, modelo, talla, pieza y dimensiones."
+        if st.button("Restaurar valores detectados del CUT", key="reset_cut_draft"):
+            st.session_state.cut_working_library = st.session_state.cut_detected.copy()
+            st.session_state.cut_editor_revision = (
+                st.session_state.get("cut_editor_revision", 0) + 1
             )
-            st.dataframe(
-                consolidation_conflicts,
-                hide_index=True,
+
+        with st.form("cut_library_form", clear_on_submit=False):
+            detected_edited = st.data_editor(
+                st.session_state.cut_working_library,
+                num_rows="dynamic",
                 use_container_width=True,
+                key=f"detected_editor_v{st.session_state.get('cut_editor_revision', 0)}",
+                disabled=[
+                    "Modelo", "Talla", "Pieza", "InstanciasCUT", "Cantidad",
+                    "Origenes", "IDRepresentante", "DimensionStatus",
+                ],
+                column_config={
+                    "ConflictoCritico": st.column_config.CheckboxColumn(
+                        "Conflicto crítico",
+                        help="Desmarque solo después de corregir y revisar la pieza.",
+                    ),
+                    "RepeticionesTalla": st.column_config.NumberColumn(
+                        "Repeticiones talla", min_value=1, step=1, format="%d",
+                    ),
+                    "Ancho": st.column_config.NumberColumn(
+                        "Ancho transversal", min_value=0.0001, format="%.4f",
+                    ),
+                    "Largo": st.column_config.NumberColumn(
+                        "Largo longitudinal", min_value=0.0001, format="%.4f",
+                    ),
+                },
             )
+            save_cut, accept_cut = st.columns(2)
+            save_cut_clicked = save_cut.form_submit_button(
+                "Guardar y validar correcciones", use_container_width=True
+            )
+            accept_cut_clicked = accept_cut.form_submit_button(
+                "Usar biblioteca detectada", type="primary", use_container_width=True
+            )
+
+        if save_cut_clicked or accept_cut_clicked:
+            st.session_state.cut_working_library = detected_edited.copy()
+            # Renovar el editor en el siguiente rerun para que sus cambios
+            # no vuelvan a aplicarse sobre una base ya modificada.
+            st.session_state.cut_editor_revision += 1
+
+        current_cut = st.session_state.cut_working_library
+        if not conflicts.empty:
+            st.error(
+                "Hay conflictos entre los CUT cargados. Corrija los archivos "
+                "de origen para resolverlos antes de utilizar la biblioteca."
+            )
+            st.dataframe(conflicts, hide_index=True, use_container_width=True)
 
         normalized = None
         normalization_errors = pd.DataFrame()
         try:
-            normalized = normalize_library(detected_edited)
+            normalized = normalize_library(current_cut)
         except LibraryNormalizationError as error:
             normalization_errors = error.to_frame()
-            st.error(
-                "La biblioteca no es válida todavía. Corrija las repeticiones, "
-                "dimensiones o conflictos indicados."
-            )
-            st.dataframe(
-                normalization_errors,
-                hide_index=True,
-                use_container_width=True,
-            )
+            st.error("La biblioteca tiene errores que requieren corrección.")
+            st.dataframe(normalization_errors, hide_index=True, use_container_width=True)
 
         st.subheader("Biblioteca normalizada")
         if normalized is not None:
             st.dataframe(normalized, hide_index=True, use_container_width=True)
         else:
-            st.caption("No disponible hasta resolver todos los errores críticos.")
+            st.caption("No disponible hasta resolver los errores críticos.")
 
         unresolved_conflicts = bool(
-            detected_edited.get(
-                "ConflictoCritico",
-                pd.Series(False, index=detected_edited.index),
-            )
-            .fillna(False)
-            .astype(bool)
-            .any()
+            current_cut.get(
+                "ConflictoCritico", pd.Series(False, index=current_cut.index)
+            ).fillna(False).astype(bool).any()
         )
-
         can_use_library = (
             normalized is not None
-            and consolidation_conflicts.empty
+            and conflicts.empty
             and normalization_errors.empty
             and not unresolved_conflicts
         )
 
-        left, right = st.columns(2)
-        if left.button(
-            "Usar biblioteca detectada",
-            type="primary",
-            use_container_width=True,
-            disabled=not can_use_library,
-        ):
-            st.session_state.library = normalized.drop(
-                columns=["Unidad", "Confianza"],
-                errors="ignore",
-            )
-            clear_calculation_results()
-            st.success("Biblioteca enviada al optimizador de planes.")
+        if accept_cut_clicked:
+            if can_use_library:
+                st.session_state.library = normalized.drop(
+                    columns=["Unidad", "Confianza"], errors="ignore"
+                ).copy()
+                st.session_state.plan_editor_revision = (
+                    st.session_state.get("plan_editor_revision", 0) + 1
+                )
+                clear_calculation_results()
+                st.success("Biblioteca enviada al optimizador.")
+            else:
+                st.warning("La biblioteca se guardó, pero aún no se puede utilizar.")
+        elif save_cut_clicked:
+            st.success("Correcciones conservadas para esta sesión.")
 
-        if can_use_library:
-            right.download_button(
+        if can_use_library and st.checkbox(
+            "Preparar descarga de biblioteca en Excel", value=False,
+            key="prepare_cut_excel",
+        ):
+            st.download_button(
                 "Descargar biblioteca y diagnóstico",
                 library_excel(normalized, diagnostics),
-                "biblioteca_cut.xlsx",
-                use_container_width=True,
-            )
-        else:
-            right.button(
-                "Descargar biblioteca y diagnóstico",
-                disabled=True,
-                use_container_width=True,
-                help="Resuelva primero todos los conflictos y errores.",
+                "biblioteca_cut.xlsx", use_container_width=True,
             )
 
-        selected_filename = st.selectbox(
-            "Archivo para visualizar",
-            [parsed["diagnostic"]["Archivo"] for parsed in parsed_files],
-        )
-        selected_parsed = next(
-            parsed
-            for parsed in parsed_files
-            if parsed["diagnostic"]["Archivo"] == selected_filename
-        )
-        st.plotly_chart(cut_figure(selected_parsed), use_container_width=True)
+        # Plotly con muchos contornos es caro: nunca construir el gráfico
+        # si el usuario no pidió visualizarlo expresamente.
+        if st.checkbox("Mostrar contornos CUT", value=False, key="show_cut_plot"):
+            selected_index = st.selectbox(
+                "Archivo para visualizar", range(len(parsed_files)),
+                format_func=lambda index: parsed_files[index]["diagnostic"]["Archivo"],
+                key="cut_selected_file_index",
+            )
+            st.plotly_chart(
+                cut_figure(parsed_files[selected_index]), use_container_width=True
+            )
     else:
         st.info("Cargue un CUT/TXT para construir la biblioteca.")
 
 
 with tab_plan:
-    with st.sidebar:
-        st.header("Configuración del plan")
-
-        fabric_width = st.number_input(
-            "Ancho útil de tela",
-            min_value=0.01,
-            value=72.0,
-            step=0.5,
-        )
-
-        st.subheader("Rango de capas")
-        layer_col_1, layer_col_2 = st.columns(2)
-        layers_min = layer_col_1.number_input(
-            "Capas mínimas",
-            min_value=1,
-            value=40,
-            step=1,
-        )
-        layers_max = layer_col_2.number_input(
-            "Capas máximas",
-            min_value=1,
-            value=60,
-            step=1,
-        )
-        layer_step = st.number_input(
-            "Incremento de capas",
-            min_value=1,
-            value=1,
-            step=1,
-        )
-        top_k_plans = st.number_input(
-            "Planes a conservar",
-            min_value=1,
-            max_value=10,
-            value=5,
-            step=1,
-        )
-
-        st.subheader("Límites por marcador")
-        max_marker_length = st.number_input(
-            "Largo máximo por marcador",
-            min_value=1.0,
-            value=500.0,
-            step=10.0,
-        )
-        target_length_input = st.number_input(
-            "Largo objetivo por marcador",
-            min_value=1.0,
-            value=450.0,
-            step=10.0,
-        )
-        target_marker_length = min(
-            float(target_length_input),
-            float(max_marker_length),
-        )
-        if target_length_input > max_marker_length:
-            st.warning(
-                "El objetivo supera el máximo. Se utilizará "
-                f"{target_marker_length:.2f}."
-            )
-
-        max_distinct_sizes = st.number_input(
-            "Máximo de tallas diferentes",
-            min_value=1,
-            value=3,
-            step=1,
-        )
-        max_markers = st.number_input(
-            "Máximo de marcadores del plan",
-            min_value=1,
-            value=20,
-            step=1,
-        )
-
-        st.subheader("Búsqueda 2D")
-        random_iterations = st.slider(
-            "Órdenes aleatorios por propuesta",
-            min_value=0,
-            max_value=40,
-            value=8,
-        )
-        allow_overproduction = st.checkbox(
-            "Completar divisiones no enteras con sobreproducción",
-            value=True,
-        )
-
-    valid_layer_range = layers_min <= layers_max
-    if not valid_layer_range:
-        st.error("Capas mínimas no puede ser mayor que Capas máximas.")
-
-    st.subheader("Datos de entrada")
-    left, right = st.columns(2)
-    with left:
-        st.caption("Biblioteca de piezas")
-        library = st.data_editor(
-            st.session_state.library,
-            num_rows="dynamic",
-            use_container_width=True,
-            key="plan_library_editor",
-        )
-    with right:
-        st.caption("Requerimientos")
-        requirements = st.data_editor(
-            st.session_state.requirements,
-            num_rows="dynamic",
-            use_container_width=True,
-            key="plan_requirements_editor",
-        )
-
-    st.session_state.library = library
-    st.session_state.requirements = requirements
-
-    generate_clicked = st.button(
-        "Calcular planes y acomodaciones 2D",
-        type="primary",
-        use_container_width=True,
-        disabled=not valid_layer_range,
+    st.subheader("Configuración y datos del plan")
+    st.caption(
+        "Modifique todos los valores y tablas. Streamlit solo aplicará los cambios "
+        "al pulsar Guardar o Calcular; no se reiniciará con cada cifra que escriba."
     )
+
+    # Formulario único: todos los parámetros y ambas tablas se confirman juntos.
+    # La revisión de los editores impide aplicar cambios anteriores dos veces.
+    with st.form("plan_inputs_form", clear_on_submit=False):
+        with st.expander("Parámetros de búsqueda", expanded=True):
+            group_width, group_layers, group_markers = st.columns(3)
+            with group_width:
+                fabric_width = st.number_input(
+                    "Ancho útil de tela", min_value=0.01, value=72.0,
+                    step=0.5, key="cfg_fabric_width",
+                )
+                max_marker_length = st.number_input(
+                    "Largo máximo por marcador", min_value=1.0, value=500.0,
+                    step=10.0, key="cfg_max_marker_length",
+                )
+                target_length_input = st.number_input(
+                    "Largo objetivo por marcador", min_value=1.0, value=450.0,
+                    step=10.0, key="cfg_target_length",
+                )
+            with group_layers:
+                layers_min = st.number_input(
+                    "Capas mínimas", min_value=1, value=40,
+                    step=1, key="cfg_layers_min",
+                )
+                layers_max = st.number_input(
+                    "Capas máximas", min_value=1, value=60,
+                    step=1, key="cfg_layers_max",
+                )
+                layer_step = st.number_input(
+                    "Incremento de capas", min_value=1, value=1,
+                    step=1, key="cfg_layer_step",
+                )
+                top_k_plans = st.number_input(
+                    "Planes a conservar", min_value=1, max_value=10,
+                    value=5, step=1, key="cfg_top_k_plans",
+                )
+            with group_markers:
+                max_distinct_sizes = st.number_input(
+                    "Máximo de tallas diferentes", min_value=1, value=3,
+                    step=1, key="cfg_max_distinct_sizes",
+                )
+                max_markers = st.number_input(
+                    "Máximo de marcadores del plan", min_value=1,
+                    value=20, step=1, key="cfg_max_markers",
+                )
+                search_mode = st.selectbox(
+                    "Profundidad de búsqueda 2D",
+                    ["Rápido", "Equilibrado", "Profundo"],
+                    index=1, key="cfg_search_mode",
+                    help=(
+                        "Presupuesto nominal de 4, 8 o búsqueda completa por propuesta. "
+                        "Si no se encuentra una solución factible, se prueban más."
+                    ),
+                )
+                random_iterations = st.slider(
+                    "Órdenes aleatorios disponibles", 0, 16, value=8,
+                    key="cfg_random_iterations",
+                    help="Se usan en búsqueda profunda o si las primeras pruebas no encuentran acomodo.",
+                )
+                allow_overproduction = st.checkbox(
+                    "Completar divisiones no enteras con sobreproducción",
+                    value=True, key="cfg_allow_overproduction",
+                )
+
+        st.subheader("Datos de entrada")
+        left, right = st.columns(2)
+        revision = st.session_state.get("plan_editor_revision", 0)
+        with left:
+            st.caption("Biblioteca de piezas")
+            library = st.data_editor(
+                st.session_state.library,
+                num_rows="dynamic", use_container_width=True,
+                key=f"plan_library_editor_v{revision}",
+            )
+        with right:
+            st.caption("Requerimientos")
+            requirements = st.data_editor(
+                st.session_state.requirements,
+                num_rows="dynamic", use_container_width=True,
+                key=f"plan_requirements_editor_v{revision}",
+            )
+        save_col, run_col = st.columns([1, 2])
+        save_clicked = save_col.form_submit_button(
+            "Guardar datos y parámetros", use_container_width=True
+        )
+        generate_clicked = run_col.form_submit_button(
+            "Calcular planes y acomodaciones 2D", type="primary",
+            use_container_width=True,
+        )
+
+    valid_layer_range = int(layers_min) <= int(layers_max)
+    target_marker_length = min(float(target_length_input), float(max_marker_length))
+    packing_budget = {
+        "Rápido": 4,
+        "Equilibrado": 8,
+        "Profundo": (4 + int(random_iterations)) * 5,
+    }[search_mode]
+
+    if save_clicked or generate_clicked:
+        st.session_state.library = library.copy(deep=True)
+        st.session_state.requirements = requirements.copy(deep=True)
+        st.session_state.plan_editor_revision = (
+            st.session_state.get("plan_editor_revision", 0) + 1
+        )
+        clear_calculation_results()
+
+    if save_clicked:
+        st.success("Biblioteca, requerimientos y parámetros guardados en esta sesión.")
 
     if generate_clicked:
         input_errors = validate(library, requirements)
+        if not valid_layer_range:
+            input_errors.append("Capas mínimas no puede superar capas máximas.")
+        if target_length_input > max_marker_length:
+            st.warning(
+                "El largo objetivo supera al máximo y se ajustará al máximo."
+            )
         if input_errors:
             for error in input_errors:
                 st.error(error)
@@ -422,9 +424,11 @@ with tab_plan:
                     (int(layers_max) - int(layers_min)) // int(layer_step)
                 ) + 1
                 with st.spinner(
-                    f"Evaluando {total_layer_values} cantidades de capas y "
-                    "múltiples acomodaciones MaxRects..."
+                    f"Evaluando {total_layer_values} valores de capas "
+                    f"(modo {search_mode.lower()}, {packing_budget} pruebas nominales)."
                 ):
+                    # Compartido SOLO dentro de este cálculo, no entre cambios de CUT.
+                    # Reutiliza la misma geometría en varios números de capas.
                     st.session_state.layer_alternatives = evaluate_layer_range(
                         plan_factory=generate_marker_plan,
                         layers_min=int(layers_min),
@@ -440,7 +444,14 @@ with tab_plan:
                         max_markers=int(max_markers),
                         random_iterations=int(random_iterations),
                         allow_overproduction=bool(allow_overproduction),
+                        packing_budget=int(packing_budget),
+                        packing_cache={},
                     )
+                st.session_state.last_run_settings = {
+                    "max_marker_length": float(max_marker_length),
+                    "search_mode": search_mode,
+                    "layers_evaluated": total_layer_values,
+                }
             except (PlanGenerationError, ValueError) as error:
                 st.error(str(error))
             except Exception as error:
@@ -525,20 +536,24 @@ with tab_plan:
             f"**Capas:** {selected_marker.layers}  \n"
             f"**Tallas diferentes:** {selected_marker.distinct_sizes}  \n"
             f"**Largo 2D:** {selected_marker.estimated_length:.2f} de "
-            f"{max_marker_length:.2f} máximo  \n"
+            f"{st.session_state.get('last_run_settings', {}).get('max_marker_length', max_marker_length):.2f} máximo  \n"
             f"**Método:** `{selected_marker.strategy}`"
         )
 
-        st.plotly_chart(
-            packing_figure(
-                selected_marker.packing,
-                title=(
-                    f"{selected_marker.marker_id} · "
-                    f"{selected_marker.layers} capas"
+        if st.checkbox(
+            "Mostrar acomodo rectangular 2D", value=False,
+            key="show_marker_plot",
+        ):
+            st.plotly_chart(
+                packing_figure(
+                    selected_marker.packing,
+                    title=(
+                        f"{selected_marker.marker_id} · "
+                        f"{selected_marker.layers} capas"
+                    ),
                 ),
-            ),
-            use_container_width=True,
-        )
+                use_container_width=True,
+            )
 
         st.subheader("Coordenadas de colocación")
         st.dataframe(
@@ -577,7 +592,7 @@ with tab_method:
 1. El CUT se interpreta con **Y como ancho transversal** y **X como largo longitudinal**.
 2. Cada pieza se representa mediante su rectángulo envolvente `Ancho × Largo`.
 3. Cada cantidad de capas dentro del rango se evalúa como una alternativa productiva.
-4. Para cada marcador se prueban diversas heurísticas **MaxRects** y distintos órdenes de piezas.
+4. Se prueba una muestra de órdenes y heurísticas **MaxRects** (4 u 8 pruebas en los modos rápidos; búsqueda completa en Profundo). Si las primeras pruebas no encuentran acomodo, se prueban las restantes antes de descartar la combinación.
 5. Las piezas reciben coordenadas `X/Y`; los huecos rectangulares pueden reutilizarse.
 6. Todas las piezas de una repetición permanecen dentro del mismo marcador.
 7. El sistema conserva una lista corta de planes según largo, eficiencia, cantidad de marcadores y sobreproducción.
