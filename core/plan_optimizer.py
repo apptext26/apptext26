@@ -197,6 +197,8 @@ def _evaluate_marker(
     random_iterations: int,
     max_marker_length: float,
     marker_id: str = "TEMP",
+    packing_budget: int = 8,
+    packing_cache: dict | None = None,
 ) -> ProposedMarker:
     repetitions = _clean_repetitions(repetitions)
     items = expand_rectangles(library, repetitions)
@@ -206,15 +208,36 @@ def _evaluate_marker(
             "El marcador propuesto no contiene piezas."
         )
 
-    try:
-        packing = pack_rectangles(
-            items=items,
-            fabric_width=float(fabric_width),
-            max_length=float(max_marker_length),
-            random_iterations=int(random_iterations),
-        )
-    except ValueError as error:
-        raise PlanGenerationError(str(error)) from error
+    packing_key = (
+        tuple(sorted(repetitions.items())),
+        float(fabric_width),
+        float(max_marker_length),
+        int(random_iterations),
+        int(packing_budget),
+    )
+    if packing_cache is not None and packing_key in packing_cache:
+        packing = packing_cache[packing_key]
+        if packing is None:
+            raise PlanGenerationError("No existe un packing factible para esta combinación.")
+    else:
+        try:
+            packing = pack_rectangles(
+                items=items,
+                fabric_width=float(fabric_width),
+                max_length=float(max_marker_length),
+                random_iterations=int(random_iterations),
+                max_evaluations=int(packing_budget),
+            )
+        except ValueError as error:
+            if packing_cache is not None:
+                if len(packing_cache) >= 256:
+                    packing_cache.pop(next(iter(packing_cache)))
+                packing_cache[packing_key] = None
+            raise PlanGenerationError(str(error)) from error
+        if packing_cache is not None:
+            if len(packing_cache) >= 256:
+                packing_cache.pop(next(iter(packing_cache)))
+            packing_cache[packing_key] = packing
 
     integrity = _integrity_ok(library, repetitions, packing)
 
@@ -280,6 +303,8 @@ def generate_marker_plan(
     max_markers: int = 20,
     random_iterations: int = 8,
     allow_overproduction: bool = True,
+    packing_budget: int = 8,
+    packing_cache: dict | None = None,
 ) -> MarkerPlan:
     """
     Genera un plan de marcadores mediante packing rectangular 2D.
@@ -328,6 +353,8 @@ def generate_marker_plan(
     )
     remaining = dict(required)
     marker_cache: Dict[tuple, ProposedMarker | None] = {}
+    if packing_cache is None:
+        packing_cache = {}
     markers: List[ProposedMarker] = []
 
     def evaluate(
@@ -345,6 +372,8 @@ def generate_marker_plan(
                     layers=int(layers),
                     random_iterations=int(random_iterations),
                     max_marker_length=float(max_marker_length),
+                    packing_budget=int(packing_budget),
+                    packing_cache=packing_cache,
                 )
             except PlanGenerationError:
                 marker_cache[cache_key] = None
