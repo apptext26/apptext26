@@ -1,15 +1,18 @@
 import hashlib
+from time import perf_counter
 
 import pandas as pd
 import streamlit as st
 
 from core.cut_parser import LibraryNormalizationError, normalize_library, parse_cut
 from core.cut_library import consolidate_cut_libraries
-from core.layer_optimizer import evaluate_layer_range
+from core.layer_optimizer import evaluate_layer_range, fabric_consumption, sample_layers
 from core.packing_visualization import packing_figure
 from core.plan_optimizer import PlanGenerationError, generate_marker_plan, marker_summary
+from core.mixed_layer_optimizer import generate_mixed_alternatives
 from core.validation import validate
 from exports import library_excel
+from exports.diagnostics import build_diagnostic_zip
 from visualization import cut_figure
 
 
@@ -21,8 +24,8 @@ st.set_page_config(
 
 st.title("Predictor de combinaciones AccuMark / AccuNest")
 st.caption(
-    "Analiza CUT/TXT, evalúa un rango de capas y propone una lista corta "
-    "de marcadores mediante packing rectangular 2D."
+    "Analiza CUT/TXT y compara planes de capas uniformes o independientes "
+    "mediante consumo de tela y packing rectangular 2D."
 )
 
 
@@ -44,6 +47,10 @@ def clear_calculation_results():
     st.session_state.pop("selected_plan_id", None)
     st.session_state.pop("selected_marker_id", None)
     st.session_state.pop("last_run_settings", None)
+    st.session_state.pop("last_run_inputs", None)
+    st.session_state.pop("diagnostic_trace", None)
+    st.session_state.pop("diagnostic_zip", None)
+    st.session_state.pop("diagnostic_all_alternatives", None)
 
 
 def format_repetitions(repetitions):
@@ -331,8 +338,23 @@ with tab_plan:
                     step=1, key="cfg_layer_step",
                 )
                 top_k_plans = st.number_input(
-                    "Planes a conservar", min_value=1, max_value=10,
+                    "Planes a mostrar", min_value=1, max_value=10,
                     value=5, step=1, key="cfg_top_k_plans",
+                )
+                mixed_enabled = st.checkbox(
+                    "Permitir capas diferentes por marcador", value=True,
+                    key="cfg_mixed_enabled",
+                    help="Conserva tendidos principales de muchas capas y evalúa cierres de pocas capas.",
+                )
+                max_layer_trials = st.number_input(
+                    "Capas uniformes a evaluar (límite)", min_value=2,
+                    max_value=24, value=7, step=1, key="cfg_layer_trials",
+                    help="Se muestrean valores del rango para evitar evaluar todos los valores.",
+                )
+                residual_trials = st.number_input(
+                    "Pruebas de cierre mixto (límite)", min_value=0,
+                    max_value=12, value=4, step=1, key="cfg_residual_trials",
+                    help="Más pruebas pueden mejorar resultados, pero elevan el tiempo de cálculo.",
                 )
             with group_markers:
                 max_distinct_sizes = st.number_input(
@@ -420,23 +442,24 @@ with tab_plan:
                 st.error(error)
         else:
             try:
-                total_layer_values = (
-                    (int(layers_max) - int(layers_min)) // int(layer_step)
-                ) + 1
+                total_layer_values = ((int(layers_max) - int(layers_min)) // int(layer_step)) + 1
+                sampled_layers = sample_layers(int(layers_min), int(layers_max), int(layer_step), int(max_layer_trials))
+                run_started = perf_counter()
+                # Caché compartida por la búsqueda de esta corrida. No sobrevive a cambios de CUT.
+                run_cache = {}
                 with st.spinner(
-                    f"Evaluando {total_layer_values} valores de capas "
-                    f"(modo {search_mode.lower()}, {packing_budget} pruebas nominales)."
+                    f"Evaluando {len(sampled_layers)} de {total_layer_values} alternativas uniformes "
+                    f"y hasta {int(residual_trials) if mixed_enabled else 0} cierres mixtos..."
                 ):
-                    # Compartido SOLO dentro de este cálculo, no entre cambios de CUT.
-                    # Reutiliza la misma geometría en varios números de capas.
-                    st.session_state.layer_alternatives = evaluate_layer_range(
+                    uniform_trace = []
+                    uniform = evaluate_layer_range(
                         plan_factory=generate_marker_plan,
-                        layers_min=int(layers_min),
-                        layers_max=int(layers_max),
+                        layers_min=int(layers_min), layers_max=int(layers_max),
                         layer_step=int(layer_step),
-                        top_k=int(top_k_plans),
-                        library=library,
-                        requirements=requirements,
+                        max_layer_trials=int(max_layer_trials),
+                        diagnostics=uniform_trace,
+                        top_k=max(5, int(top_k_plans), int(max_layer_trials)),
+                        library=library, requirements=requirements,
                         fabric_width=float(fabric_width),
                         max_marker_length=float(max_marker_length),
                         max_distinct_sizes=int(max_distinct_sizes),
@@ -444,14 +467,60 @@ with tab_plan:
                         max_markers=int(max_markers),
                         random_iterations=int(random_iterations),
                         allow_overproduction=bool(allow_overproduction),
-                        packing_budget=int(packing_budget),
-                        packing_cache={},
+                        packing_budget=int(packing_budget), packing_cache=run_cache,
                     )
+                    trace = [{"Fase": "uniformes", "Capas probadas": sampled_layers,
+                              "Alternativas retenidas": len(uniform)}] + uniform_trace
+                    mixed = []
+                    if mixed_enabled:
+                        mixed, extra_trace = generate_mixed_alternatives(
+                            uniform_alternatives=uniform,
+                            plan_factory=generate_marker_plan,
+                            library=library, requirements=requirements,
+                            layers_min=int(layers_min), layers_max=int(layers_max),
+                            layer_step=int(layer_step),
+                            max_markers=int(max_markers),
+                            allow_overproduction=bool(allow_overproduction),
+                            max_residual_trials=int(residual_trials),
+                            fabric_width=float(fabric_width),
+                            max_marker_length=float(max_marker_length),
+                            max_distinct_sizes=int(max_distinct_sizes),
+                            target_marker_length=float(target_marker_length),
+                            random_iterations=int(random_iterations),
+                            packing_budget=int(packing_budget), packing_cache=run_cache,
+                        )
+                        trace.extend(extra_trace)
+                    # Mostrar los mejores por consumo, garantizando al menos una
+                    # alternativa mixta para poder compararla si existe.
+                    eligible = [a for a in (uniform + mixed) if not a.shortage and a.plan.integrity_ok]
+                    if not eligible:
+                        raise PlanGenerationError("No se encontró un plan que cubra toda la demanda con las restricciones actuales.")
+                    eligible.sort(key=lambda a: (a.consumption, a.overproduction, a.marker_count))
+                    displayed = eligible[:int(top_k_plans)]
+                    if mixed and not any(a.mixed for a in displayed):
+                        mixed_valid = next((a for a in mixed if not a.shortage), None)
+                        if mixed_valid and displayed:
+                            displayed[-1] = mixed_valid
+                            displayed.sort(key=lambda a: (a.consumption, a.overproduction))
+                    st.session_state.layer_alternatives = displayed
+                    st.session_state.diagnostic_all_alternatives = uniform + mixed
+                    st.session_state.diagnostic_trace = trace
                 st.session_state.last_run_settings = {
+                    "version": "PATCH-003", "fabric_width": float(fabric_width),
                     "max_marker_length": float(max_marker_length),
-                    "search_mode": search_mode,
-                    "layers_evaluated": total_layer_values,
+                    "target_marker_length": float(target_marker_length),
+                    "max_distinct_sizes": int(max_distinct_sizes),
+                    "max_markers": int(max_markers),
+                    "layers_min": int(layers_min), "layers_max": int(layers_max),
+                    "layer_step": int(layer_step), "layers_evaluated": sampled_layers,
+                    "search_mode": search_mode, "packing_budget": packing_budget,
+                    "mixed_enabled": bool(mixed_enabled),
+                    "residual_trials": int(residual_trials),
+                    "random_iterations": int(random_iterations),
+                    "allow_overproduction": bool(allow_overproduction),
+                    "total_seconds": round(perf_counter() - run_started, 4),
                 }
+                st.session_state.last_run_inputs = (library.copy(deep=True), requirements.copy(deep=True))
             except (PlanGenerationError, ValueError) as error:
                 st.error(str(error))
             except Exception as error:
@@ -460,29 +529,62 @@ with tab_plan:
     alternatives = st.session_state.get("layer_alternatives", [])
     if alternatives:
         st.subheader("Planes recomendados")
+        st.caption(
+            "Consumo lineal estimado = Σ (largo de cada marker × sus capas). "
+            "La eficiencia es rectangular; no representa la eficiencia final de AccuNest. "
+            "La búsqueda mixta es heurística, no garantiza el mínimo global."
+        )
         plan_rows = [
             {
-                "Plan": alternative.plan_id,
-                "Capas": alternative.layers,
-                "Marcadores": alternative.marker_count,
-                "Largo acumulado": alternative.total_length,
-                "Eficiencia rectangular %": alternative.average_efficiency * 100,
-                "Faltante": alternative.shortage,
-                "Sobreproducción": alternative.overproduction,
-                "Puntuación": alternative.score,
+                "Plan": a.plan_id,
+                "Tipo": "Mixto" if a.mixed else "Uniforme",
+                "Capas": f"{min(m.layers for m in a.plan.markers)}–{max(m.layers for m in a.plan.markers)}" if a.mixed else str(a.layers),
+                "Marcadores": a.marker_count,
+                "Consumo estimado": a.consumption,
+                "Suma largos markers": a.total_length,
+                "Eficiencia rectangular %": a.average_efficiency * 100,
+                "Faltante": a.shortage, "Sobreproducción": a.overproduction,
             }
-            for alternative in alternatives
+            for a in alternatives
         ]
         st.dataframe(
-            pd.DataFrame(plan_rows),
-            hide_index=True,
-            use_container_width=True,
+            pd.DataFrame(plan_rows), hide_index=True, use_container_width=True,
             column_config={
-                "Largo acumulado": st.column_config.NumberColumn(format="%.2f"),
+                "Consumo estimado": st.column_config.NumberColumn(format="%.2f"),
+                "Suma largos markers": st.column_config.NumberColumn(format="%.2f"),
                 "Eficiencia rectangular %": st.column_config.NumberColumn(format="%.2f%%"),
-                "Puntuación": st.column_config.NumberColumn(format="%.2f"),
             },
         )
+        if len(alternatives) > 1:
+            best_uniform = min((a.consumption for a in alternatives if not a.mixed), default=None)
+            best_mixed = min((a.consumption for a in alternatives if a.mixed), default=None)
+            if best_uniform is not None and best_mixed is not None:
+                change = (best_mixed / best_uniform - 1) * 100
+                st.info(f"Mejor mixto vs. mejor uniforme mostrado: {change:+.2f}% de consumo "
+                        "(negativo = menos tela). Comparación heurística, no óptimo demostrado.")
+        st.caption(f"Tiempo de la última corrida: {st.session_state.get('last_run_settings', {}).get('total_seconds', 0):.2f} s.")
+
+        with st.expander("Exportar diagnóstico para mejorar el algoritmo", expanded=False):
+            st.write("Genera un ZIP con parámetros, entrada CUT normalizada, requerimientos, "
+                     "consumo por plan/marker, cobertura por talla, coordenadas y una plantilla "
+                     "para anotar los resultados reales de AccuNest.")
+            st.caption("El paquete contiene datos industriales de tu proyecto: compártelo solamente según tus permisos.")
+            if st.button("Preparar reporte de esta corrida", key="prepare_diagnostic"):
+                inputs = st.session_state.get("last_run_inputs")
+                if inputs:
+                    st.session_state.diagnostic_zip = build_diagnostic_zip(
+                        inputs[0], inputs[1],
+                        st.session_state.get("diagnostic_all_alternatives", alternatives),
+                        st.session_state.get("last_run_settings", {}),
+                        st.session_state.get("diagnostic_trace", []),
+                    )
+            if st.session_state.get("diagnostic_zip"):
+                st.download_button(
+                    "Descargar diagnóstico ZIP (CSV + JSON)",
+                    data=st.session_state.diagnostic_zip,
+                    file_name="minerva_diagnostico_patch003.zip",
+                    mime="application/zip", key="download_diagnostic",
+                )
 
         selected_plan_id = st.selectbox(
             "Plan para revisar",
@@ -497,22 +599,27 @@ with tab_plan:
         plan = selected_alternative.plan
 
         st.subheader(
-            f"{selected_alternative.plan_id} · {selected_alternative.layers} capas"
+            f"{selected_alternative.plan_id} · "
+            f"{'capas mixtas' if selected_alternative.mixed else str(selected_alternative.layers) + ' capas'}"
         )
         metric_1, metric_2, metric_3, metric_4, metric_5 = st.columns(5)
-        metric_1.metric("Capas", selected_alternative.layers)
+        metric_1.metric("Capas", f"{min(m.layers for m in plan.markers)}–{max(m.layers for m in plan.markers)}")
         metric_2.metric("Marcadores", len(plan.markers))
-        metric_3.metric("Largo acumulado", f"{plan.total_length:.2f}")
-        metric_4.metric("Eficiencia", f"{plan.average_efficiency:.2%}")
+        metric_3.metric("Consumo estimado", f"{fabric_consumption(plan):,.2f}")
+        metric_4.metric("Eficiencia rect. ponderada", f"{selected_alternative.average_efficiency:.2%}")
         metric_5.metric("Sobreproducción", selected_alternative.overproduction)
+        st.caption(f"Suma de largos de los archivos marker: {plan.total_length:.2f}. "
+                   "El consumo anterior incluye las capas independientes.")
 
         st.subheader("Marcadores del plan")
+        marker_rows = marker_summary(plan)
+        for row, marker in zip(marker_rows, plan.markers):
+            row["Consumo estimado"] = marker.layers * marker.estimated_length
         st.dataframe(
-            pd.DataFrame(marker_summary(plan)),
-            hide_index=True,
-            use_container_width=True,
+            pd.DataFrame(marker_rows), hide_index=True, use_container_width=True,
             column_config={
                 "Largo estimado": st.column_config.NumberColumn(format="%.2f"),
+                "Consumo estimado": st.column_config.NumberColumn(format="%.2f"),
                 "Eficiencia %": st.column_config.NumberColumn(format="%.2f%%"),
             },
         )
@@ -555,20 +662,22 @@ with tab_plan:
                 use_container_width=True,
             )
 
-        st.subheader("Coordenadas de colocación")
-        st.dataframe(
-            placement_table(selected_marker),
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "X": st.column_config.NumberColumn(format="%.2f"),
-                "Y": st.column_config.NumberColumn(format="%.2f"),
-                "Ancho": st.column_config.NumberColumn(format="%.2f"),
-                "Largo": st.column_config.NumberColumn(format="%.2f"),
-                "X final": st.column_config.NumberColumn(format="%.2f"),
-                "Y final": st.column_config.NumberColumn(format="%.2f"),
-            },
-        )
+        st.caption("Gráfico horizontal: eje X = largo longitudinal; eje Y = ancho transversal. "
+                   "Las coordenadas numéricas del motor se conservan sin rotar piezas.")
+        with st.expander("Coordenadas de colocación", expanded=False):
+            st.dataframe(
+                placement_table(selected_marker),
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "X": st.column_config.NumberColumn(format="%.2f"),
+                    "Y": st.column_config.NumberColumn(format="%.2f"),
+                    "Ancho": st.column_config.NumberColumn(format="%.2f"),
+                    "Largo": st.column_config.NumberColumn(format="%.2f"),
+                    "X final": st.column_config.NumberColumn(format="%.2f"),
+                    "Y final": st.column_config.NumberColumn(format="%.2f"),
+                },
+            )
 
         st.subheader("Auditoría de piezas del marcador")
         piece_audit = marker_piece_audit(library, selected_marker)
@@ -591,17 +700,20 @@ with tab_method:
 
 1. El CUT se interpreta con **Y como ancho transversal** y **X como largo longitudinal**.
 2. Cada pieza se representa mediante su rectángulo envolvente `Ancho × Largo`.
-3. Cada cantidad de capas dentro del rango se evalúa como una alternativa productiva.
+3. Se muestrea una selección de capas uniformes; la búsqueda mixta también ajusta las capas por marcador sin crear faltantes.
 4. Se prueba una muestra de órdenes y heurísticas **MaxRects** (4 u 8 pruebas en los modos rápidos; búsqueda completa en Profundo). Si las primeras pruebas no encuentran acomodo, se prueban las restantes antes de descartar la combinación.
 5. Las piezas reciben coordenadas `X/Y`; los huecos rectangulares pueden reutilizarse.
 6. Todas las piezas de una repetición permanecen dentro del mismo marcador.
-7. El sistema conserva una lista corta de planes según largo, eficiencia, cantidad de marcadores y sobreproducción.
+7. El sistema compara **Σ(largo marker × capas)**, no solo suma de largos. Intenta sustituir cierres por markers con menos capas y reducir las capas de marcadores menos eficientes sin generar faltantes.
+8. Se exporta un diagnóstico reproducible (CSV y JSON) para comparar predicción frente a resultados reales de AccuNest.
 
 ### Alcance
 
 Este motor realiza **packing rectangular 2D**. Todavía no utiliza concavidades,
 curvas ni colisiones entre los contornos reales de las piezas, y no sustituye el
-nesting poligonal de AccuNest. La rotación automática permanece desactivada hasta
+nesting poligonal de AccuNest. El optimizador de capas es heurístico y no
+garantiza óptimo global. El consumo excluye extremos, empalmes y merma de tendido.
+La rotación automática permanece desactivada hasta
 disponer de información fiable sobre sentido de hilo y orientaciones permitidas.
         """
     )
