@@ -6,11 +6,11 @@ import streamlit as st
 
 from core.cut_parser import LibraryNormalizationError, normalize_library, parse_cut
 from core.cut_library import consolidate_cut_libraries
-from core.layer_optimizer import evaluate_layer_range, fabric_consumption, sample_layers
+from core.layer_optimizer import fabric_consumption
 from core.packing_visualization import packing_figure
 from core.plan_optimizer import PlanGenerationError, generate_marker_plan, marker_summary
-from core.mixed_layer_optimizer import generate_mixed_alternatives
-from core.validation import validate
+from core.relaxation import solve_with_preferences
+from core.validation import estimate_feasibility, validate
 from exports import library_excel
 from exports.diagnostics import build_diagnostic_zip
 from visualization import cut_figure
@@ -51,6 +51,7 @@ def clear_calculation_results():
     st.session_state.pop("diagnostic_trace", None)
     st.session_state.pop("diagnostic_zip", None)
     st.session_state.pop("diagnostic_all_alternatives", None)
+    st.session_state.pop("diagnostic_best_partial", None)
 
 
 def format_repetitions(repetitions):
@@ -305,6 +306,11 @@ with tab_plan:
         "Modifique todos los valores y tablas. Streamlit solo aplicará los cambios "
         "al pulsar Guardar o Calcular; no se reiniciará con cada cifra que escriba."
     )
+    st.caption(
+        "Los valores de esta sección son preferencias, no obligaciones: si no existe "
+        "un plan que las cumpla exactamente, la app relajará lo mínimo necesario "
+        "(marcadores, capas, largo o tallas por marcador) y le avisará qué ajustó."
+    )
 
     # Formulario único: todos los parámetros y ambas tablas se confirman juntos.
     # La revisión de los editores impide aplicar cambios anteriores dos veces.
@@ -348,13 +354,24 @@ with tab_plan:
                 )
                 max_layer_trials = st.number_input(
                     "Capas uniformes a evaluar (límite)", min_value=2,
-                    max_value=24, value=7, step=1, key="cfg_layer_trials",
-                    help="Se muestrean valores del rango para evitar evaluar todos los valores.",
+                    max_value=60, value=7, step=1, key="cfg_layer_trials",
+                    help="Se muestrean valores del rango para evitar evaluar todos los valores. "
+                         "Si no se cubre la demanda, la app también intenta un muestreo más "
+                         "denso de forma automática antes de relajar cualquier otra preferencia.",
                 )
                 residual_trials = st.number_input(
                     "Pruebas de cierre mixto (límite)", min_value=0,
                     max_value=12, value=4, step=1, key="cfg_residual_trials",
                     help="Más pruebas pueden mejorar resultados, pero elevan el tiempo de cálculo.",
+                )
+                adaptive_enabled = st.checkbox(
+                    "Relajar automáticamente si no hay solución exacta", value=True,
+                    key="cfg_adaptive_enabled",
+                    help="Si no existe un plan que cumpla marcadores, capas, largo y tallas "
+                         "tal cual se configuraron, la app prueba versiones progresivamente "
+                         "más permisivas de estos valores hasta cubrir toda la demanda, y le "
+                         "informa exactamente qué tuvo que ajustar. Desactive esta opción si "
+                         "prefiere que la app falle en vez de apartarse de sus valores.",
                 )
             with group_markers:
                 max_distinct_sizes = st.number_input(
@@ -441,90 +458,139 @@ with tab_plan:
             for error in input_errors:
                 st.error(error)
         else:
+            for feasibility_warning in estimate_feasibility(
+                library, requirements,
+                fabric_width=float(fabric_width),
+                max_marker_length=float(max_marker_length),
+                layers_max=int(layers_max),
+                max_markers=int(max_markers),
+            ):
+                st.warning(feasibility_warning)
             try:
                 total_layer_values = ((int(layers_max) - int(layers_min)) // int(layer_step)) + 1
-                sampled_layers = sample_layers(int(layers_min), int(layers_max), int(layer_step), int(max_layer_trials))
                 run_started = perf_counter()
-                # Caché compartida por la búsqueda de esta corrida. No sobrevive a cambios de CUT.
-                run_cache = {}
                 with st.spinner(
-                    f"Evaluando {len(sampled_layers)} de {total_layer_values} alternativas uniformes "
-                    f"y hasta {int(residual_trials) if mixed_enabled else 0} cierres mixtos..."
+                    f"Evaluando hasta {int(max_layer_trials)} de {total_layer_values} alternativas "
+                    f"uniformes y hasta {int(residual_trials) if mixed_enabled else 0} cierres mixtos "
+                    "(con relajación automática si hace falta)..."
                 ):
-                    uniform_trace = []
-                    uniform = evaluate_layer_range(
-                        plan_factory=generate_marker_plan,
-                        layers_min=int(layers_min), layers_max=int(layers_max),
-                        layer_step=int(layer_step),
-                        max_layer_trials=int(max_layer_trials),
-                        diagnostics=uniform_trace,
-                        top_k=max(5, int(top_k_plans), int(max_layer_trials)),
+                    solution = solve_with_preferences(
                         library=library, requirements=requirements,
                         fabric_width=float(fabric_width),
                         max_marker_length=float(max_marker_length),
-                        max_distinct_sizes=int(max_distinct_sizes),
                         target_marker_length=float(target_marker_length),
+                        max_distinct_sizes=int(max_distinct_sizes),
                         max_markers=int(max_markers),
+                        layers_min=int(layers_min), layers_max=int(layers_max),
+                        layer_step=int(layer_step),
+                        max_layer_trials=int(max_layer_trials),
+                        top_k=max(5, int(top_k_plans), int(max_layer_trials)),
                         random_iterations=int(random_iterations),
                         allow_overproduction=bool(allow_overproduction),
-                        packing_budget=int(packing_budget), packing_cache=run_cache,
+                        packing_budget=int(packing_budget),
+                        mixed_enabled=bool(mixed_enabled),
+                        residual_trials=int(residual_trials),
+                        allow_relaxation=bool(adaptive_enabled),
                     )
-                    trace = [{"Fase": "uniformes", "Capas probadas": sampled_layers,
-                              "Alternativas retenidas": len(uniform)}] + uniform_trace
-                    mixed = []
-                    if mixed_enabled:
-                        mixed, extra_trace = generate_mixed_alternatives(
-                            uniform_alternatives=uniform,
-                            plan_factory=generate_marker_plan,
-                            library=library, requirements=requirements,
-                            layers_min=int(layers_min), layers_max=int(layers_max),
-                            layer_step=int(layer_step),
-                            max_markers=int(max_markers),
-                            allow_overproduction=bool(allow_overproduction),
-                            max_residual_trials=int(residual_trials),
-                            fabric_width=float(fabric_width),
-                            max_marker_length=float(max_marker_length),
-                            max_distinct_sizes=int(max_distinct_sizes),
-                            target_marker_length=float(target_marker_length),
-                            random_iterations=int(random_iterations),
-                            packing_budget=int(packing_budget), packing_cache=run_cache,
+                    # El diagnóstico se guarda SIEMPRE, incluso si no hubo cobertura
+                    # completa, para poder mostrarlo y exportarlo en vez de perderlo.
+                    st.session_state.diagnostic_trace = solution.trace
+                    st.session_state.diagnostic_all_alternatives = solution.alternatives
+                    st.session_state.diagnostic_best_partial = solution.best_partial
+
+                    if solution.complete:
+                        eligible = sorted(
+                            solution.alternatives,
+                            key=lambda a: (a.consumption, a.overproduction, a.marker_count),
                         )
-                        trace.extend(extra_trace)
-                    # Mostrar los mejores por consumo, garantizando al menos una
-                    # alternativa mixta para poder compararla si existe.
-                    eligible = [a for a in (uniform + mixed) if not a.shortage and a.plan.integrity_ok]
-                    if not eligible:
-                        raise PlanGenerationError("No se encontró un plan que cubra toda la demanda con las restricciones actuales.")
-                    eligible.sort(key=lambda a: (a.consumption, a.overproduction, a.marker_count))
-                    displayed = eligible[:int(top_k_plans)]
-                    if mixed and not any(a.mixed for a in displayed):
-                        mixed_valid = next((a for a in mixed if not a.shortage), None)
-                        if mixed_valid and displayed:
-                            displayed[-1] = mixed_valid
-                            displayed.sort(key=lambda a: (a.consumption, a.overproduction))
-                    st.session_state.layer_alternatives = displayed
-                    st.session_state.diagnostic_all_alternatives = uniform + mixed
-                    st.session_state.diagnostic_trace = trace
+                        displayed = eligible[:int(top_k_plans)]
+                        if not any(a.mixed for a in displayed):
+                            mixed_valid = next((a for a in eligible if a.mixed), None)
+                            if mixed_valid and displayed:
+                                displayed[-1] = mixed_valid
+                                displayed.sort(key=lambda a: (a.consumption, a.overproduction))
+                        st.session_state.layer_alternatives = displayed
+                    else:
+                        st.session_state.pop("layer_alternatives", None)
                 st.session_state.last_run_settings = {
-                    "version": "PATCH-003", "fabric_width": float(fabric_width),
+                    "version": "PATCH-004", "fabric_width": float(fabric_width),
                     "max_marker_length": float(max_marker_length),
                     "target_marker_length": float(target_marker_length),
                     "max_distinct_sizes": int(max_distinct_sizes),
                     "max_markers": int(max_markers),
                     "layers_min": int(layers_min), "layers_max": int(layers_max),
-                    "layer_step": int(layer_step), "layers_evaluated": sampled_layers,
+                    "layer_step": int(layer_step),
                     "search_mode": search_mode, "packing_budget": packing_budget,
                     "mixed_enabled": bool(mixed_enabled),
                     "residual_trials": int(residual_trials),
                     "random_iterations": int(random_iterations),
                     "allow_overproduction": bool(allow_overproduction),
+                    "adaptive_enabled": bool(adaptive_enabled),
+                    "effective_settings": solution.effective_settings,
                     "total_seconds": round(perf_counter() - run_started, 4),
                 }
                 st.session_state.last_run_inputs = (library.copy(deep=True), requirements.copy(deep=True))
+
+                if not solution.complete:
+                    partial_note = ""
+                    if solution.best_partial is not None:
+                        partial_note = (
+                            " El mejor intento encontrado queda disponible abajo, marcado "
+                            f"como incompleto, con un faltante de {solution.best_partial.shortage} "
+                            "unidades."
+                        )
+                    st.error(
+                        "No fue posible generar un plan que cubra toda la demanda, ni "
+                        + ("relajando marcadores, capas, largo y tallas dentro de topes "
+                           "de seguridad razonables."
+                           if adaptive_enabled else
+                           "con los valores exactos configurados. Active 'Relajar "
+                           "automáticamente' arriba, o revise las advertencias de "
+                           "factibilidad.")
+                        + partial_note
+                    )
+                elif solution.relaxed:
+                    resumen = " → ".join(
+                        f"{s.etiqueta} ({s.parametro}: {s.valor_original} → {s.valor_usado})"
+                        for s in solution.steps
+                        if s.parametro is not None
+                    )
+                    st.warning(
+                        "No fue posible cumplir exactamente sus preferencias originales. "
+                        "Se relajó progresivamente hasta encontrar una solución completa. "
+                        f"Ajustes aplicados, en orden: {resumen}."
+                    )
             except (PlanGenerationError, ValueError) as error:
                 st.error(str(error))
             except Exception as error:
                 st.exception(error)
+
+    diagnostic_trace = st.session_state.get("diagnostic_trace", [])
+    best_partial = st.session_state.get("diagnostic_best_partial")
+    if diagnostic_trace and not st.session_state.get("layer_alternatives"):
+        with st.expander("Diagnóstico de la última corrida (por qué no se encontró plan)", expanded=True):
+            st.caption(
+                "Cada fila es un intento: un paso de relajación probado, o una capa "
+                "específica evaluada dentro de ese paso. 'Razón'/'Detalle' explica el "
+                "motivo del rechazo cuando aplica."
+            )
+            st.dataframe(pd.DataFrame(diagnostic_trace), hide_index=True, use_container_width=True)
+        if best_partial is not None:
+            with st.expander("Mejor intento parcial (NO cubre toda la demanda)", expanded=False):
+                st.warning(
+                    "Este plan es incompleto: faltan "
+                    f"{best_partial.shortage} unidades por producir. Se muestra solo como "
+                    "referencia del mejor esfuerzo encontrado, nunca como un plan listo "
+                    "para anidar en AccuNest/Shapeshifter."
+                )
+                st.dataframe(
+                    pd.DataFrame(marker_summary(best_partial.plan)),
+                    hide_index=True, use_container_width=True,
+                )
+                st.dataframe(
+                    pd.DataFrame(best_partial.plan.audit),
+                    hide_index=True, use_container_width=True,
+                )
 
     alternatives = st.session_state.get("layer_alternatives", [])
     if alternatives:

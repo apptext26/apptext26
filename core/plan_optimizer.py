@@ -57,6 +57,13 @@ class MarkerPlan:
     integrity_ok: bool
     coverage_ok: bool
     audit: List[dict] = field(default_factory=list)
+    # Motivo por el que la construcción se detuvo sin cubrir el 100% de la
+    # demanda. None cuando `coverage_ok` es True. Hoy el único valor posible
+    # es "max_markers" (ver `generate_marker_plan`): los demás límites
+    # (ancho de tela, largo máximo, tallas por marcador) siguen siendo
+    # duros porque afectan la factibilidad física de un marcador individual,
+    # no la cantidad de marcadores del plan completo.
+    stopped_reason: str | None = None
 
 
 class PlanGenerationError(ValueError):
@@ -309,13 +316,24 @@ def generate_marker_plan(
     """
     Genera un plan de marcadores mediante packing rectangular 2D.
 
-    Reglas duras:
+    Reglas duras (imposibles de relajar aquí; dependen de la física de la
+    tela y de un marcador individual, no de preferencias de planificación):
     - Cada marcador respeta `fabric_width`.
     - Cada marcador respeta `max_marker_length`.
     - Cada marcador contiene como máximo `max_distinct_sizes` tallas.
     - Cada repetición mantiene todas sus piezas en el mismo marcador.
     - Cada pieza se coloca exactamente una vez.
     - No se permite rotación automática.
+
+    `max_markers` es distinto: es una preferencia sobre el TAMAÑO del plan,
+    no una imposibilidad física. Si la demanda no cabe dentro de
+    `max_markers` marcadores, esta función YA NO lanza una excepción: se
+    detiene y devuelve el `MarkerPlan` parcial construido hasta ese punto,
+    con `coverage_ok=False`, `stopped_reason="max_markers"` y el faltante
+    real por talla visible en `audit`. Quien llama (ver `core.relaxation`)
+    decide si ese resultado parcial es aceptable, si reintenta con un
+    `max_markers` mayor, o si lo presenta al usuario como el mejor intento
+    posible dentro del límite pedido.
     """
     if int(layers) <= 0:
         raise PlanGenerationError(
@@ -356,6 +374,7 @@ def generate_marker_plan(
     if packing_cache is None:
         packing_cache = {}
     markers: List[ProposedMarker] = []
+    stopped_reason: str | None = None
 
     def evaluate(
         repetitions: Dict[str, int],
@@ -382,11 +401,11 @@ def generate_marker_plan(
 
     while any(value > 0 for value in remaining.values()):
         if len(markers) >= int(max_markers):
-            raise PlanGenerationError(
-                "La demanda requiere más marcadores que el máximo permitido. "
-                "Aumente el máximo de marcadores, el largo máximo o revise "
-                "el rango de capas."
-            )
+            # `max_markers` es preferible, no obligatorio: se detiene la
+            # construcción con lo que ya se logró en vez de descartar toda
+            # la corrida. El faltante queda registrado en `audit` más abajo.
+            stopped_reason = "max_markers"
+            break
 
         current_repetitions: Dict[str, int] = {}
         current_marker: ProposedMarker | None = None
@@ -454,7 +473,10 @@ def generate_marker_plan(
                 raise PlanGenerationError(
                     f"Una repetición de {failing_key} no puede acomodarse "
                     f"dentro de ancho {fabric_width:.2f} y largo máximo "
-                    f"{max_marker_length:.2f}."
+                    f"{max_marker_length:.2f}. Este es un límite físico real: "
+                    "si el problema es de largo, aumentar 'largo máximo por "
+                    "marcador' puede resolverlo; si es de ancho, la pieza no "
+                    "cabe en la tela y ningún parámetro de búsqueda lo arregla."
                 )
 
             raise PlanGenerationError(
@@ -553,6 +575,7 @@ def generate_marker_plan(
         integrity_ok=integrity_ok,
         coverage_ok=coverage_ok,
         audit=audit,
+        stopped_reason=stopped_reason if not coverage_ok else None,
     )
 
 
