@@ -8,12 +8,9 @@ antes de correr el packing 2D completo (que puede tardar), de si el volumen
 de la demanda luce incompatible con los parámetros configurados. Es una
 estimación optimista (asume una eficiencia de empaque razonable y reparto
 perfecto entre marcadores), así que solo advierte cuando el faltante
-proyectado es grande. La búsqueda real (`core.adaptive_planner`) es siempre
+proyectado es grande. La búsqueda real (`core.relaxation`) es siempre
 la que decide de verdad.
 """
-from __future__ import annotations
-
-from typing import Any
 
 REQUIRED_LIBRARY_COLUMNS = ["Modelo", "Talla", "Pieza", "Cantidad", "Ancho", "Largo"]
 REQUIRED_REQUIREMENT_COLUMNS = ["Modelo", "Talla", "Unidades"]
@@ -23,9 +20,9 @@ REQUIRED_REQUIREMENT_COLUMNS = ["Modelo", "Talla", "Unidades"]
 _ASSUMED_PACKING_EFFICIENCY = 0.85
 
 
-def validate(library: Any, requirements: Any) -> list[str]:
+def validate(library, requirements):
     """Verifica columnas, valores mínimos y correspondencia entre tablas."""
-    errors: list[str] = []
+    errors = []
 
     for column in REQUIRED_LIBRARY_COLUMNS:
         if column not in library:
@@ -83,15 +80,15 @@ def validate(library: Any, requirements: Any) -> list[str]:
 
 
 def estimate_feasibility(
-    library: Any,
-    requirements: Any,
-    fabric_width: float,
-    max_marker_length: float,
-    layers_max: int,
-    max_markers: int,
-) -> list[str]:
+    library,
+    requirements,
+    fabric_width,
+    max_marker_length,
+    layers_max,
+    max_markers,
+):
     """Avisos no bloqueantes sobre factibilidad, calculados antes del packing 2D."""
-    warnings: list[str] = []
+    warnings = []
 
     for column in REQUIRED_LIBRARY_COLUMNS:
         if column not in library:
@@ -114,7 +111,7 @@ def estimate_feasibility(
             "esta es una restricción física, no una preferencia."
         )
 
-    area_per_repetition: dict[tuple[str, str], float] = {}
+    area_per_repetition = {}
     for _, row in library.iterrows():
         key = (str(row["Modelo"]), str(row["Talla"]))
         area_per_repetition[key] = area_per_repetition.get(key, 0.0) + (
